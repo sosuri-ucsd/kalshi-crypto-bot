@@ -1,0 +1,17 @@
+# secrets -- never commit
+kalshi_key.key
+*.key
+*.pem
+
+# raw / derived data dumps -- huge, regenerable from the scripts in this repo.
+# This repo tracks CODE and the running test log, not data blobs.
+*.json
+*.jsonl
+*.csv
+*.log
+data/
+
+# python
+__pycache__/
+*.pyc
+.DS_Store
