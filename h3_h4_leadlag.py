@@ -150,11 +150,12 @@ def build_aligned_series(ticker, series_name, bucket_series, binance):
     kprices = [b["price"] for b in bucket_series]
     if any(p is None for p in kprices):
         return None  # window had zero Kalshi trades the whole time - can't use it
+    traded = [bool(b.get("traded", False)) for b in bucket_series]
     bucket_ts_list = [b["bucket_ts"] for b in bucket_series]
     bprices = [price_at_or_before(times, closes, ts) for ts in bucket_ts_list]
     if any(p is None or p <= 0 for p in bprices):
         return None
-    return kprices, bprices, bucket_ts_list
+    return kprices, bprices, bucket_ts_list, traded
 
 def main():
     rows = load_windows()
@@ -169,27 +170,19 @@ def main():
         except FileNotFoundError:
             print(f"WARNING: binance_1s_{sym}.json not found - windows for that symbol will be skipped", flush=True)
 
-    # sort windows chronologically for the H4 train/test split (must NOT be random -
-    # we need a genuinely future, non-overlapping holdout, same lesson as the
-    # Polymarket same-window contamination case)
+    # sort windows chronologically (must NOT be random - we need a genuinely future,
+    # non-overlapping holdout, same lesson as the Polymarket same-window contamination case)
     rows_sorted = sorted(rows, key=lambda r: parse_time(r["open_time"]))
-    n_train_windows = int(len(rows_sorted) * TRAIN_FRACTION)
-    train_tickers = set(r["ticker"] for r in rows_sorted[:n_train_windows])
-    test_tickers = set(r["ticker"] for r in rows_sorted[n_train_windows:])
-    print(f"\nChronological split for H4: {len(train_tickers)} train windows (earlier in time), "
-          f"{len(test_tickers)} test windows (later in time, never touched during fitting)", flush=True)
 
-    offsets = list(range(-MAX_LAG, MAX_LAG + 1))  # e.g. [-2,-1,0,1,2]
-    # offset > 0  => binance return AFTER the current Kalshi tick -> tests "Kalshi LEADS Binance"
-    # offset < 0  => binance return BEFORE the current Kalshi tick -> tests "Kalshi LAGS Binance"
-    h3_labels = ["intercept"] + [f"binance_ret_t{o:+d}" for o in offsets]
-
-    h3_X, h3_y, h3_clusters = [], [], []
-    h4_train_X, h4_train_y = [], []
-    h4_test_rows = []  # (X_row, y_actual, ticker) for test set, predictors restricted to non-future info
-
-    n_windows_used, n_windows_skipped = 0, 0
-
+    # ---- PASS 1: figure out which windows are actually usable (Kalshi trades AND
+    # matching Binance coverage) BEFORE computing the train/test split. The old version
+    # split on ALL 15,548 windows by date, but Binance 1s data only covers ~9 of the ~56
+    # days in windows_backfill.csv, so the ~1,493 usable windows are NOT evenly spread
+    # across that split - they clustered almost entirely in one partition, leaving the
+    # other with zero rows and crashing H4 with an empty training set. Fix: compute the
+    # 70/30 split over the usable windows ONLY, in their own chronological order. ----
+    usable = []  # (ticker, series_name, kprices, bprices, traded) in chronological order
+    n_windows_skipped = 0
     for r in rows_sorted:
         ticker = r["ticker"]
         series_name = r["series"]
@@ -201,9 +194,29 @@ def main():
         if aligned is None:
             n_windows_skipped += 1
             continue
-        n_windows_used += 1
-        kprices, bprices, _ = aligned
+        kprices, bprices, _, traded = aligned
+        usable.append((ticker, series_name, kprices, bprices, traded))
 
+    n_train_windows = int(len(usable) * TRAIN_FRACTION)
+    train_tickers = set(u[0] for u in usable[:n_train_windows])
+    test_tickers = set(u[0] for u in usable[n_train_windows:])
+    print(f"\nWindows usable: {len(usable)}, skipped (no Kalshi trades / missing Binance data): {n_windows_skipped}", flush=True)
+    print(f"Chronological split for H4, computed over USABLE windows only: {len(train_tickers)} train, "
+          f"{len(test_tickers)} test (later in time, never touched during fitting)", flush=True)
+
+    offsets = list(range(-MAX_LAG, MAX_LAG + 1))  # e.g. [-2,-1,0,1,2]
+    # offset > 0  => binance return AFTER the current Kalshi tick -> tests "Kalshi LEADS Binance"
+    # offset < 0  => binance return BEFORE the current Kalshi tick -> tests "Kalshi LAGS Binance"
+    h3_labels = ["intercept"] + [f"binance_ret_t{o:+d}" for o in offsets]
+
+    h3_X, h3_y, h3_clusters = [], [], []
+    h3b_X, h3b_y, h3b_clusters = [], [], []
+    h4_train_X, h4_train_y = [], []
+    h4_test_rows = []  # (X_row, y_actual, ticker) for test set, predictors restricted to non-future info
+
+    n_stale_excluded_h3, n_stale_excluded_h4 = 0, 0
+
+    for ticker, series_name, kprices, bprices, traded in usable:
         kdelta = [None] + [kprices[i] - kprices[i - 1] for i in range(1, len(kprices))]
         bret = [None] + [math.log(bprices[i] / bprices[i - 1]) for i in range(1, len(bprices))]
 
@@ -212,6 +225,16 @@ def main():
 
         for t in range(MAX_LAG, n_buckets - MAX_LAG):
             if kdelta[t] is None:
+                continue
+            # FIX for the staleness/non-synchronous-trading confound: Kalshi is thinly
+            # traded (especially SOL), so most 5s buckets just forward-fill the last
+            # trade price -> kdelta is mechanically 0, not a real "no movement" data
+            # point. Using those as the regression OUTCOME lets stretches of stale
+            # zeros line up with whatever Binance is doing and manufacture a spurious
+            # "lead". Only treat bucket t as a real outcome if Kalshi actually traded in
+            # bucket t (traded[t] is True) - i.e. a genuine new price was set.
+            if not traded[t]:
+                n_stale_excluded_h3 += 1
                 continue
             # --- H3 panel: full lead/lag window (uses future Binance info on purpose,
             # this is an EXPLANATORY regression about direction of co-movement, not a forecast) ---
@@ -227,10 +250,22 @@ def main():
                 h3_X.append(feats_h3)
                 h3_y.append(kdelta[t])
                 h3_clusters.append(ticker)
+                # --- H3b diagnostic: is Binance's own t+1 return predictable from its
+                # t-2..t+0 returns (own short-horizon autocorrelation)? If yes, that's a
+                # competing explanation for the H3 "t+1 effect": bret_t+1 is collinear
+                # with bret_t+0 (which truly co-moves with kdelta_t), so some of bret_t0's
+                # true contemporaneous effect can leak into the bret_t+1 coefficient even
+                # with no real "Kalshi leads Binance" relationship. ---
+                h3b_X.append([1.0, bret[t - 2], bret[t - 1], bret[t]])
+                h3b_y.append(bret[t + 1])
+                h3b_clusters.append(ticker)
 
             # --- H4 panel: forecasting model, ONLY past/contemporaneous info allowed
             # (offsets <= 0), predicting next-tick Kalshi delta (kdelta[t+1]) ---
             if t + 1 < n_buckets and kdelta[t + 1] is not None:
+                if not traded[t + 1]:
+                    n_stale_excluded_h4 += 1
+                    continue
                 feats_h4 = [1.0]
                 ok4 = True
                 for o in offsets:
@@ -249,7 +284,8 @@ def main():
                     else:
                         h4_test_rows.append((feats_h4, kdelta[t + 1], ticker))
 
-    print(f"\nWindows usable: {n_windows_used}, skipped (no Kalshi trades / missing Binance data): {n_windows_skipped}", flush=True)
+    print(f"Stale (non-traded) buckets excluded as regression outcomes: {n_stale_excluded_h3} (H3), "
+          f"{n_stale_excluded_h4} (H4 additional)", flush=True)
 
     # ================= H3: pooled lead-lag regression =================
     print(f"\n=== H3: Kalshi_delta_t ~ Binance_log_return at t-{MAX_LAG}..t+{MAX_LAG} (5s buckets) ===", flush=True)
@@ -272,10 +308,34 @@ def main():
     else:
         print("Not enough data yet to fit H3 regression.", flush=True)
 
+    # ================= H3b: Binance's own short-horizon autocorrelation (diagnostic) =================
+    print(f"\n=== H3b diagnostic: Binance_ret_t+1 ~ Binance_ret_t-2,t-1,t+0 (own autocorrelation, "
+          f"same {len(set(h3b_clusters))} windows) ===", flush=True)
+    print("Purpose: if Binance's own near-term returns are autocorrelated, that alone can make bret_t+1\n"
+          "collinear with bret_t+0 (which truly co-moves with kdelta_t), producing exactly the spurious\n"
+          "'Kalshi leads Binance at t+1' pattern seen in H3 even with zero real lead. This is the\n"
+          "competing, non-staleness explanation for that result.", flush=True)
+    if len(h3b_y) > 5 and len(set(h3b_clusters)) > 1:
+        beta_b, se_b, n_b, k_b, G_b, resid_b = ols_cluster_robust(h3b_X, h3b_y, h3b_clusters)
+        tp_b = t_and_p(beta_b, se_b)
+        labels_b = ["intercept", "bret_t-2", "bret_t-1", "bret_t+0"]
+        mean_y = sum(h3b_y) / len(h3b_y)
+        sst_b = sum((y - mean_y) ** 2 for y in h3b_y)
+        sse_b = sum(r ** 2 for r in resid_b)
+        r2_b = 1 - sse_b / sst_b if sst_b > 0 else float("nan")
+        print(f"{'term':12s} {'coef':>10s} {'se':>10s} {'t':>8s} {'p':>8s}", flush=True)
+        for label, b, s, (t, p) in zip(labels_b, beta_b, se_b, tp_b):
+            print(f"{label:12s} {b:10.6f} {s:10.6f} {t:8.2f} {p:8.4f}", flush=True)
+        print(f"R^2 = {r2_b:.5f}  (in-sample fraction of bret_t+1's variance explained by its own t-2..t+0 lags -- "
+              f"the higher this is, the more the H3 't+1 leads' coefficient is plausibly just autocorrelation "
+              f"bleeding through collinear lags rather than Kalshi genuinely front-running)", flush=True)
+    else:
+        print("Not enough data for H3b diagnostic.", flush=True)
+
     # ================= H4: out-of-sample forecast + costed backtest =================
     print(f"\n=== H4: out-of-sample forecast (train on earlier {len(train_tickers)} windows, "
           f"test on later {len(test_tickers)} windows, never touched during fit) ===", flush=True)
-    if len(h4_train_y) > len(h4_train_X[0]) + 1 and h4_test_rows:
+    if h4_train_X and len(h4_train_y) > len(h4_train_X[0]) + 1 and h4_test_rows:
         beta4, _ = ols_fit(h4_train_X, h4_train_y)
         preds = [sum(x[j] * beta4[j] for j in range(len(beta4))) for x, _, _ in h4_test_rows]
         actuals = [a for _, a, _ in h4_test_rows]

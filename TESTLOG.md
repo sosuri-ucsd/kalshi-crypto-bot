@@ -100,20 +100,51 @@ chronological train/test split was computed over ALL 15,548 windows by date, but
 usable (Binance-matched) windows were apparently concentrated outside the train
 range given the coverage gap).
 
-**Known issues, fix in progress:**
-1. Coverage gap (90% of windows have no Binance match) -- need either a Binance
-   1s backfill covering the full 05-02 to 06-27 range, or to restrict/caveat the
-   analysis to the 06-17 to 06-26 overlap.
-2. Crash: train/test split must be computed over USABLE windows only, not all
-   windows, and the code needs to handle an empty train/test set gracefully.
-3. Methodology: the t+1/t+2 "Kalshi leads Binance" coefficients are suspect --
-   likely confounded by (a) Binance's own short-horizon return autocorrelation
-   (5s crypto returns aren't independent) and (b) Kalshi price staleness (thin
-   markets forward-fill the last trade price across empty buckets, which can
-   mechanically create a spurious lead). Needs an AR-baseline-controlled
-   (Granger-style) test restricted to buckets with a genuine new Kalshi trade,
-   not the forward-filled price.
+**Run 2 (after fixes):**
 
-*(this entry will be updated in place once the fix is run -- see commit history)*
+Fix 1 (crash): train/test split is now computed over the 1,493 USABLE windows only
+(in their own chronological order), not over all 15,548. Result: 1,045 train /
+448 test windows, both non-empty. H4 no longer crashes.
+
+Fix 2 (staleness): both H3's outcome (`kdelta_t`) and H4's forecast target
+(`kdelta_t+1`) now require `traded=True` on that bucket (a genuine new Kalshi
+trade, not a forward-filled stale carry). Excluded 19,767 stale buckets from H3,
+11,883 more from H4.
+
+**H3 after fix:** n=243,123 obs, same pattern as before, slightly *stronger*:
+t+0 coef=38.1 t=24.7 p<.00001, t+1 coef=82.0 t=23.7 p<.00001, t+2 coef=4.3 t=5.3
+p<.00001, all BH-survive; t-1/t-2 still null. **The staleness fix did NOT kill the
+t+1 effect** -- ruling out forward-fill staleness as the explanation.
+
+**H3b diagnostic (new) -- is it just Binance's own autocorrelation?**
+Regressed `binance_ret_t+1 ~ binance_ret_t-2,t-1,t+0` on the same windows: t-1 coef
+0.035 (p<.00001), t+0 coef 0.055 (p<.00001), R^2=0.0045. Binance's own near-term
+returns ARE significantly autocorrelated, which is a real, available channel for
+the H3 t+1 coefficient to be partly/wholly spurious (collinearity bleed-through
+from the true t+0 effect) -- but R^2=0.0045 is small, so it's not obviously enough
+*on its own* to fully explain a t+1 coefficient more than 2x the size of t+0.
+Honest read: the t+1 "lead" is not fully explained by either confound tested so
+far; likely some mix of real microstructure lag (Kalshi order processing/matching
+delay) and residual autocorrelation bleed. Not chasing this further -- see verdict.
+
+**H4 after fix (the test that actually matters -- can this be traded):**
+n_test=72,596, out-of-sample R^2 = **-0.00005** (i.e. zero -- the model explains
+nothing on genuinely future data). Costed backtest: mean P&L/trade = **-0.0099**,
+i.e. directionally betting on this "predictive" relationship just bleeds the
+assumed 0.01 round-trip cost, consistent with the predictions being indistinguishable
+from noise.
+
+**Verdict: the H3 association is statistically real (BH-survives, survives two
+separate confound checks) but H4 confirms it carries ZERO out-of-sample forecasting
+power.** Whatever is producing the t+1 coefficient (partial Binance autocorrelation
+bleed + possibly genuine but tiny microstructure lag), it is not exploitable as a
+trading signal. Consistent with every other test in this project: no edge here either.
+
+**Still open, not fixed (lower priority, user flagged skepticism about this whole
+avenue up front):** the 90%-missing Binance coverage gap. All numbers above are
+restricted to the 1,493-window / 9-day overlap (2026-06-17 to 06-26) where Binance
+data exists; the other ~47 days of the 56-day Kalshi range are entirely untested
+here. Closing this would require a new Binance 1s backfill (a multi-day-spanning
+candle fetch -- a separate, larger task, not started).
 
 ---
