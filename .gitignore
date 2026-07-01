@@ -1,17 +1,27 @@
-# secrets -- never commit
+# credentials - never commit
 kalshi_key.key
 *.key
 *.pem
+.env
 
-# raw / derived data dumps -- huge, regenerable from the scripts in this repo.
-# This repo tracks CODE and the running test log, not data blobs.
-*.json
-*.jsonl
-*.csv
+# runtime data
+bot/decisions.jsonl
+bot/paper_trades.jsonl
+bot/paper_report.json
+paper_trade_debug*.log
 *.log
+*.jsonl
+*.json
+*.csv
 data/
 
 # python
 __pycache__/
 *.pyc
 .DS_Store
+
+# latex artifacts
+*.aux
+*.out
+*.pdf
+*.tex

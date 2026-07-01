@@ -1,131 +1,158 @@
-# Kalshi 15-Min Crypto Edge Tests
+# Kalshi Crypto Arbitrage Bot
 
-Statistical research project testing for exploitable mispricing in Kalshi's 15-minute
-binary options markets on BTC, ETH, and SOL. The core question: can early-window price
-information — or its correlation with Binance spot — generate a profitable betting signal?
-
-The answer so far is no, and the project documents exactly why, in enough methodological
-detail to distinguish "tested properly and found nothing" from "didn't look hard enough."
+A quantitative trading bot exploiting the Binance-to-Kalshi repricing lag on 15-minute binary prediction markets for BTC, ETH, and SOL.
 
 ---
 
-## Methodology rules (applied throughout)
+## Overview
 
-- **Chronological 70/30 train/holdout split.** Hyperparameters and spec selection happen on
-  the train set only. Results are reported once on the untouched holdout — never re-tested.
-- **BH-FDR correction** across all hypothesis batteries. Every grid search and model
-  comparison applies Benjamini-Hochberg to control false discovery rate across the batch.
-- **Block-bootstrap by day** for confidence intervals. Individual 15-min windows within a
-  calendar day are correlated (same spot path), so bootstrapping resamples whole days.
-- **Costed backtests.** Profit calculations deduct an assumed 0.01 round-trip transaction
-  cost per contract throughout.
-- **Holdout reported once.** No iterating on holdout results.
+Kalshi's BTC/ETH/SOL 15-minute markets settle YES if the Binance spot price at close is at or above a floor strike recorded at window open. Kalshi reprices these odds 3-7 seconds after Binance spot moves. During that window, the market is mispriced. This bot connects to Binance at 200ms WebSocket latency, detects the move in real time, and bets on Kalshi before odds catch up. Two signals drive every decision - an Anchor Price (AP) signal derived from early-window Kalshi trade prices, and a GBM signal computed from live Binance spot price and rolling volatility. Both must agree on direction before any bet is placed. The system currently runs in paper trading mode on live Kalshi data.
+
+---
+
+## How It Works
+
+### The Edge
+
+Kalshi reprices BTC/ETH/SOL odds 3-7 seconds after Binance spot moves. During that window the market is mispriced. The bot detects the move on Binance and bets on Kalshi before it catches up.
+
+### Signal 1: Anchor Price (AP)
+
+The Anchor Price is the mean of YES trade prices accumulated during the first K seconds of each 15-minute window. Kalshi's early-window price already encodes the market's partial read on where spot is relative to the floor strike. An OLS regression maps AP to P(YES):
+
+```
+p_hat = b0 + b1 * AP
+```
+
+Coefficients are refit daily on an expanding window of prior data (`bot/recal.py`). Validated on historical Kalshi trade data through a 12-step research pipeline with chronological train/holdout splits and block-bootstrap confidence intervals.
+
+### Signal 2: GBM (Geometric Brownian Motion)
+
+The GBM signal computes the risk-neutral probability using live Binance spot price and rolling realized volatility:
+
+```
+Z = (ln(S_now) - ln(floor_strike)) / (sigma_per_second * sqrt(T_remaining))
+P(YES) = Normal_CDF(Z)
+```
+
+`sigma_per_second` is the standard deviation of log-returns from the trailing 600 Binance aggTrade ticks (approximately 10 minutes), normalized from per-tick to per-second units via `sqrt(ticks_per_second)`. GBM is capped at 0.80 - crypto fat tails mean the formula overestimates certainty at extremes.
+
+### Entry Logic
+
+1. GBM confidence gate: `|GBM - 0.5|` must exceed a per-series floor before any evaluation begins
+2. AP must confirm GBM direction - both signals must be on the same side, not just not-contradicting
+3. Bounce filter: for YES bets, GBM must have dipped below 0.45 at some earlier point in the window and now be recovering. For NO bets, GBM must have spiked above 0.55 and now be falling. This avoids buying the top or selling the bottom. The filter is bypassed if GBM exceeds 0.75 (strong trend, not a bounce).
+4. Blend and threshold: `blended_p = 0.3 * p_hat + 0.7 * GBM_capped`. No bet if `|blended_p - 0.5| < T`.
+
+### Exit Logic
+
+- Dynamic exit: if GBM reverses past threshold mid-window (below 0.40 for YES, above 0.60 for NO), sell at current bid
+- Pin risk: if spot is within 0.1% of floor strike in the last 2 minutes, exit immediately - outcome is coin-flip and Kalshi spread is widest at the pin
+- Pre-expiry: close all positions 90 seconds before settlement regardless of GBM value
+
+### Sizing
+
+Kelly criterion with half-Kelly multiplier (0.5x), tiered by signal strength:
+
+| Edge magnitude | Max bet |
+|----------------|---------|
+| >= 30% | 25% of bankroll |
+| >= 20% | 18% of bankroll |
+| >= 12% | 10% of bankroll |
+| < 12% | 5% of bankroll |
+
+Circuit breakers: 10% session drawdown halves the Kelly fraction; 20% session drawdown pauses all trading for 15 minutes.
+
+---
+
+## Series Configuration
+
+| Series | Asset | AP window (K) | GBM floor | Bet cap |
+|--------|-------|---------------|-----------|---------|
+| KXBTC15M | Bitcoin | 300s | 0.10 | 25% |
+| KXETH15M | Ether | 120s | 0.15 | 18% |
+| KXSOL15M | Solana | 300s | 0.15 | 18% |
+
+BTC uses a lower GBM floor because it is less volatile - GBM moves slowly on BTC and needs a lower threshold to fire. ETH uses a shorter AP window because it has lower Kalshi trade volume, so fewer trades accumulate in 300s.
+
+---
+
+## Architecture
+
+```
+bot/
+  brain.py         - pure decision logic (no API calls, no credentials)
+  config.py        - all strategy constants
+  sizing.py        - Kelly fraction, Kalshi fee calculation
+  recal.py         - daily OLS recalibration on historical data
+  run_live.py      - Kalshi WebSocket and REST integration
+  paper_trader.py  - paper trading on live Kalshi data (simulated fills)
+  manual.py        - signal mode: live pulse + alerts, you place bets manually
+  executor.py      - order execution stub (not yet connected to live trading)
+  feeds/
+    binance_ws.py  - Binance WebSocket feed, rolling realized sigma
+```
+
+`brain.py` is the core. It is pure logic: no network calls, no file I/O, no credentials. All external I/O lives in `run_live.py` and `paper_trader.py`. This separation makes the signal logic independently testable and replaceable.
+
+---
+
+## Setup
+
+```bash
+pip install websockets requests cryptography numpy pandas scikit-learn
+```
+
+1. Place your Kalshi RSA private key at `kalshi_key.key` in the repo root.
+2. Update `KEY_ID` in `bot/config.py` with your Kalshi API key ID.
+3. Prepare the feature dataset: `h1_comprehensive_features.csv` must be present at the repo root for OLS recalibration. See `bot/recal.py` for the expected schema.
+
+---
+
+## Running
+
+### Paper trading (simulated fills on live Kalshi data)
+
+```bash
+python3 -m bot.paper_trader --bankroll 20
+```
+
+With debug logging to see GBM updates every 4 seconds:
+
+```bash
+python3 -m bot.paper_trader --bankroll 20 --log-level DEBUG
+```
+
+### Manual signal mode
+
+The bot watches all open markets and prints a live pulse every 4 seconds showing GBM probability, spot vs. strike distance, and a one-line action recommendation. When a signal fires, it prints a full bet card with exact contracts and outlay based on your real Kalshi balance. You place the bet manually on Kalshi.
+
+```bash
+python3 -m bot.manual
+```
+
+### Dry-run order check
+
+```bash
+python3 -c "
+from bot.executor import place_order
+from bot.run_live import _load_key
+key = _load_key('kalshi_key.key')
+result = place_order(key, 'KXBTC15M-26JUL031445-50000', 'yes', 1, 55, dry_run=True)
+print(result)
+"
+```
 
 ---
 
 ## Results
 
-| # | Script | Question | Verdict |
-|---|--------|----------|---------|
-| 1 | `tests/h1_strategy_backtest.py` | Profit from betting when early price deviates from 0.50? (all series pooled) | **No edge.** Holdout mean profit −0.003/contract, 95% CI [−0.086, +0.085] over 16 days |
-| 2 | `tests/h5_per_series_regression.py` | Does early avg price (`sig`) predict outcome, per-series? | **Signal is real, not exploitable.** OOS AUC 0.62–0.65 across BTC/ETH/SOL; mechanically expected (price = market's probability estimate), betting cost equals the signal |
-| 3 | `tests/h6_calibration_signal_test.py` | Is the price systematically miscalibrated (slope ≠ 1)? | **Miscalibration real in-sample, doesn't generalize.** Holdout Brier improvement CIs include 0 in all 3 series |
-| 4 | `tests/h3_h4_leadlag.py` | Does Kalshi price lead/lag Binance spot? | **Association BH-survives two confound checks; OOS forecasting power is zero.** H4 OOS R² = −0.00005; costed P&L = −0.010/trade |
+Paper trading results are tracked in `bot/paper_trades.jsonl` (gitignored locally). The paper trader runs on live Kalshi WebSocket data with simulated fills at the ask price. Metrics including win rate, Sharpe per bet, profit factor, and bankroll curve are printed hourly and on Ctrl+C exit.
 
-Full methodology notes, confound checks, and diagnostics: [TESTLOG.md](TESTLOG.md).
+Results are from paper trading on live Kalshi data and do not guarantee live trading performance.
 
 ---
 
-## Repo layout
+## Disclaimer
 
-```
-collection/         data collection layer
-  backfill_kalshi.py          REST backfill: Kalshi market metadata + OHLC candles
-  fetch_kalshi_trades.py      REST backfill: trade-level tape -> kalshi_trades.json
-  fetch_binance_1s.py         Binance 1s kline fetch (recent window) -> binance_1s_*.json
-  fetch_binance_history.py    Binance 1m history -> binance_klines_*.json
-  fetch_settlements.py        Settlement results -> settlements.json
-  ws_kalshi.py                Live Kalshi WebSocket feed (ticks -> data/kalshi_*.jsonl)
-  ws_binance.py               Live Binance WebSocket feed (spot prices)
-  kalshi_live.py              Live trading skeleton (order placement, not yet active)
-  test_kalshi.py              API connectivity smoke test
-  start_session.sh / stop_session.sh   Session management for live data collection
-
-features/           feature extraction layer (inputs -> flat CSVs for test scripts)
-  build_features_backfill.py  Kalshi candle data -> windows_backfill.csv (15,548 windows)
-  build_features.py           Live/incremental variant of above
-  bucket_kalshi_trades.py     Trade tape -> 5s buckets -> kalshi_trades_5s.json
-  stream_process_trades.py    Streaming variant: trade tape -> 5s buckets + fixedtime features
-  h1_grid_extract.py          Trade-level features for 25-spec grid -> h1_comprehensive_features.csv
-  h1_avgN_extract.py          First-N-trades features -> h1_avgN_features.csv
-
-tests/              hypothesis tests (reported results in TESTLOG.md)
-  h1_strategy_backtest.py     TESTLOG #1: pooled threshold-sweep profit backtest
-  h5_per_series_regression.py TESTLOG #2: per-series linear + logistic battery on sig/log_speed
-  h6_calibration_signal_test.py TESTLOG #3: calibration slope vs. 1, OOS Brier improvement
-  h3_h4_leadlag.py            TESTLOG #4: Kalshi vs Binance spot lead/lag + OOS forecast
-  h1_grid_battery.py          Core grid search: 225 boundary×threshold combos, BH-FDR, AUC/Brier
-  h1_augmented_model.py       Augmented model (sig + momentum + vol): Clark-West test, block bootstrap
-  stress_test.py              Stress tests: leave-one-day-out CV, permutation test on momentum
-  power_calc.py               Sample-size / power calculation for per-day effect
-  momentum_sigtest.py         Momentum signal significance: correlation + AUC + permutation p-value
-  archive/                    Superseded exploratory scripts (see header comment in each)
-
-README.md           this file
-TESTLOG.md          full test log with raw numbers, confound checks, open questions
-learning_guide.md   self-study guide: every statistical method used and the 4 source papers
-```
-
----
-
-## How to run
-
-All scripts resolve data-file paths relative to the **repo root** — run them from there:
-
-```bash
-# Step 1: collect (needs kalshi_key.key at repo root — not checked in)
-python collection/backfill_kalshi.py          # -> backfill_markets.json, backfill_candles.json
-python collection/fetch_kalshi_trades.py       # -> kalshi_trades.json
-python collection/fetch_binance_1s.py          # -> binance_1s_BTC/ETH/SOLUSDT.json
-python collection/fetch_binance_history.py     # -> binance_klines_BTC/ETH/SOLUSDT.json
-
-# Step 2: build features
-python features/build_features_backfill.py    # -> windows_backfill.csv
-python features/bucket_kalshi_trades.py        # -> kalshi_trades_5s.json
-python features/h1_grid_extract.py             # -> h1_comprehensive_features.csv
-python features/h1_avgN_extract.py             # -> h1_avgN_features.csv
-
-# Step 3: run tests
-python tests/h1_strategy_backtest.py
-python tests/h5_per_series_regression.py
-python tests/h6_calibration_signal_test.py
-python tests/h3_h4_leadlag.py
-```
-
-Data files (`*.json`, `*.csv`, `data/`) are gitignored. They live at the repo root during a
-session and are never committed. The `kalshi_key.key` RSA private key is also gitignored.
-
----
-
-## Dataset
-
-15,548 windows across BTC, ETH, SOL 15-min contracts on Kalshi (2026-05-02 to 2026-06-27).
-Binance 1s spot data covers only 2026-06-17 to 06-26 (~9 of 56 days) — the lead/lag test
-(TESTLOG #4) is restricted to this 1,493-window overlap. Closing the coverage gap requires
-a new multi-day Binance 1s backfill (not started).
-
----
-
-## What was archived and why
-
-`tests/archive/` holds 5 scripts that were exploratory dead ends or were superseded by
-better versions. Each has a one-line header explaining what replaced it:
-
-- `analyze_h1_h2.py` — 1-min kline feature extraction, replaced by trade-level extraction
-  in `features/h1_grid_extract.py` (finer resolution, no stale-price floor hack needed)
-- `analyze_h2_subminute.py` — sub-minute CSV extraction step that was never consumed by any
-  reported test; the lead/lag analysis (`h3_h4_leadlag.py`) reads 5s buckets directly
-- `h1_logistic.py` — single-boundary logistic fit predating the full 225-combo grid battery
-- `h1_avgN_analysis.py` — per-N exploratory pass predating `h5_per_series_regression.py`
-  (which adds proper chronological split and BH correction)
-- `momentum_demo.py` — quick demo without significance tests, replaced by `momentum_sigtest.py`
+This project is for research and educational purposes. Prediction market trading involves financial risk. Paper trading performance does not guarantee future live results.
