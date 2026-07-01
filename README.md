@@ -70,7 +70,7 @@ Circuit breakers: 10% session drawdown halves the Kelly fraction; 20% session dr
 | Series | Asset | AP window (K) | GBM floor | Bet cap |
 |--------|-------|---------------|-----------|---------|
 | KXBTC15M | Bitcoin | 300s | 0.10 | 25% |
-| KXETH15M | Ether | 120s | 0.15 | 18% |
+| KXETH15M | Ethereum | 120s | 0.15 | 18% |
 | KXSOL15M | Solana | 300s | 0.15 | 18% |
 
 BTC uses a lower GBM floor because it is less volatile - GBM moves slowly on BTC and needs a lower threshold to fire. ETH uses a shorter AP window because it has lower Kalshi trade volume, so fewer trades accumulate in 300s.
